@@ -52,7 +52,7 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
             else:
                 if phase == 'test':
                     # load best model weights to return and use for testing
-                    #model.load_state_dict(best_model_wts)
+                    model.load_state_dict(best_model_wts)
                     pass
                 model.eval()   # Set model to evaluate mode
 
