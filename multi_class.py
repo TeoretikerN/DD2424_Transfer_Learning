@@ -13,9 +13,14 @@ import copy
 
 data_dir = "./data/multiclass"
 num_classes = 37
-batch_size = 32
-num_epochs = 15
-layers_to_train = 0 # Number of layers to finetune other than the final layer. So [0 <= layers_to_train <= 17].
+batch_size = 512
+num_epochs = 40
+patience = 5 # Number of epochs without improving best validation acc
+layers_to_train = 2 # Number of layers to finetune other than the final layer. So [0 <= layers_to_train <= 17].
+
+save = True # True if saving metric plots
+plotname = 'vanilla_loss_'+str(layers_to_train + 1) # Name of filenames of plots
+
 
 def set_parameter_requires_grad(model, n_layers):
     count = 0
@@ -30,14 +35,18 @@ def print_params(model):
     for name, param in model.named_parameters():
         print(name, param.size(), param.requires_grad)
 
-def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
+def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, patience=999):
     since = time.time()
-
+    
     val_acc_history = []
+    val_loss_history = []
+    train_acc_history = []
+    train_loss_history = []
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
-
+    patience_count = 0
+    prev_acc = 0.0
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch+1, num_epochs))
         print('-' * 10)
@@ -87,20 +96,55 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25):
 
             print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
 
-            # deep copy the model
-            if phase == 'val' and epoch_acc > best_acc:
-                best_acc = epoch_acc
-                best_model_wts = copy.deepcopy(model.state_dict())
+            if phase == 'train':
+                train_loss_history.append(epoch_loss)
+                train_acc_history.append(epoch_acc)
             if phase == 'val':
                 val_acc_history.append(epoch_acc)
+                val_loss_history.append(epoch_loss)
+                # if epoch_acc > prev_acc:
+                if epoch_acc > best_acc:
+                    patience_count = 0
+                    best_acc = epoch_acc
+                    best_model_wts = copy.deepcopy(model.state_dict())
+                else:
+                    patience_count +=1
+                prev_acc = epoch_acc
+                if patience_count >= patience:
+                    print('Training stopped, Early stopping triggered')
+                    model.load_state_dict(best_model_wts)
+                    model.eval()   # Set model to evaluate mode
+                    # Iterate over data.
+                    running_loss = 0.0
+                    running_corrects = 0
+                    for inputs, labels in dataloaders[phase]:
+                        inputs = inputs.to(device)
+                        labels = labels.to(device)
+                        optimizer.zero_grad()
+                        with torch.set_grad_enabled(False):
+                            outputs = model(inputs)
+                            loss = criterion(outputs, labels)
+                            _, preds = torch.max(outputs, 1)
+                            running_loss += loss.item() * inputs.size(0)
+                            running_corrects += torch.sum(preds == labels.data)
 
-        print()
+                    epoch_loss = running_loss / len(dataloaders[phase].dataset)
+                    epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+                    test_acc = epoch_acc
+                    print('test Loss: {:.4f} Acc: {:.4f}'.format(epoch_loss, epoch_acc))
+                    time_elapsed = time.time() - since
+                    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+                    #print('Best val Acc: {:4f}'.format(best_acc))
+                    history = {'val_acc' : val_acc_history, 'val_loss' : val_loss_history, 'train_acc' : train_acc_history, 'train_loss' : train_loss_history, 'test_acc' : test_acc}
+                    return model, history
+
 
     time_elapsed = time.time() - since
     print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
     #print('Best val Acc: {:4f}'.format(best_acc))
+    history = {'val_acc' : val_acc_history, 'val_loss' : val_loss_history, 'train_acc' : train_acc_history, 'train_loss' : train_loss_history, 'test_acc' : test_acc}
+    return model, history
 
-    return model, val_acc_history
 
 def initialize_model(num_classes, n_layers, use_pretrained=True):
     # Use Resnet18 as model
@@ -110,14 +154,14 @@ def initialize_model(num_classes, n_layers, use_pretrained=True):
     model_ft.fc = nn.Linear(num_ftrs, num_classes)
     input_size = 224
     #print_params(model_ft)
-
+    
     return model_ft, input_size
 
 
 if __name__ == '__main__':
     # Initialize the model for this run
     model_ft, input_size = initialize_model(num_classes, layers_to_train, use_pretrained=True)
-
+    print("Model initialized")
     # Data augmentation and normalization for training
     # Just normalization for validation
     data_transforms = {
@@ -184,8 +228,6 @@ if __name__ == '__main__':
     print("Std:", std)
     """
     # -------------------------------------------
-
-
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model_ft = model_ft.to(device)
@@ -198,5 +240,31 @@ if __name__ == '__main__':
     optimizer_ft = optim.Adam(params_to_update, lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
-    model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs)
+    model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs, patience=patience)
     
+    val_acc = [x.item() for x in hist['val_acc']]
+    train_acc = [x.item() for x in hist['train_acc']]
+    val_loss = hist['val_loss']
+    train_loss = hist['train_loss']
+    epochs = [x + 1 for x in range(len(val_loss))]
+
+    # Plotting
+    acc = str(round(hist['test_acc'].item()*100, 2))
+    plt.title(f'Accuracy evolution, {layers_to_train + 1} fine-tuned layers, test acc = {acc}%')
+    plt.plot(epochs,train_acc, label='Training set accuracy')
+    plt.plot(epochs,val_acc, label='Validation set accuracy')
+    plt.plot([np.argmax(val_acc)+1],[max(val_acc)],'r*', label='Best model')
+    plt.ylim([0,1])
+    plt.legend(loc='lower right')
+    if save:
+        plt.savefig(plotname + '_acc.png')
+    plt.show()
+
+    plt.title(f'Loss evolution, {layers_to_train + 1} fine-tuned layers, test acc = {acc}%')
+    plt.plot(epochs,train_loss, label='Training set loss')
+    plt.plot(epochs,val_loss, label='Validation set loss')
+    plt.plot([np.argmax(val_acc)+1],[train_loss[np.argmax(val_acc)]],'r*', label='Best model')
+    plt.legend()
+    if save:
+        plt.savefig(plotname + '_loss.png')
+    plt.show()
