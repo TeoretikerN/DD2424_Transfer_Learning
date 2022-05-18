@@ -6,7 +6,8 @@ from PIL import Image
 from torchvision import datasets
 from torchvision import transforms
 
-from .randaugment import RandAugmentMC
+#from .randaugment import RandAugmentMC
+from randaugment import RandAugmentMC
 
 #logger = logging.getLogger(__name__)
 
@@ -32,10 +33,10 @@ def get_oxfordiiitpet(num_labeled, root):
     ])
 
     #https://pytorch.org/vision/stable/generated/torchvision.datasets.OxfordIIITPet.html#torchvision.datasets.OxfordIIITPet
-    base_dataset = datasets.OxfordIIITPet(root, target_types='category', download=True)
+    base_dataset = datasets.OxfordIIITPet(root, target_types='category', download=False)
 
     train_labeled_idxs, train_unlabeled_idxs = x_u_split(
-        num_labeled, num_classes, base_dataset.targets)
+        num_labeled, num_classes, base_dataset._labels)
 
     train_labeled_dataset = OxfordIIITPetSSL(
         root, train_labeled_idxs, split='trainval',
@@ -63,6 +64,7 @@ def x_u_split(num_labeled, num_classes, labels):
         idx = np.random.choice(idx, label_per_class, False) #label_per_class rndm samples drawn from idx
         labeled_idx.extend(idx) #adds idx to labeled_idx
     labeled_idx = np.array(labeled_idx)
+    ### if num_labeled isnt divisible by 37, an error will raise
     assert len(labeled_idx) == num_labeled
 
     ###intended to expand labels to match eval steps, didnt fully understand
@@ -104,13 +106,14 @@ class OxfordIIITPetSSL(datasets.OxfordIIITPet):
                          transform=transform,
                          target_transform=target_transform,
                          download=download)
-        if indexs is not None:
-            self.data = self.data[indexs]
-            self.targets = np.array(self.targets)[indexs]
+        if indexs is not None: 
+            ### dont know if converting to array is the solution
+            self._images = np.array(self._images)[indexs]
+            self._labels = np.array(self._labels)[indexs]
 
     def __getitem__(self, index):
-        img, target = self.data[index], self.targets[index]
-        img = Image.fromarray(img)
+        img, target = self._images[index], self._labels[index]
+        img = Image.open(img).convert("RGB")
 
         if self.transform is not None:
             img = self.transform(img)
@@ -120,4 +123,4 @@ class OxfordIIITPetSSL(datasets.OxfordIIITPet):
 
         return img, target
 
-DATASET_GETTERS = {'oxfordiiipet': get_oxfordiiitpet}
+DATASET_GETTERS = {'oxfordiiitpet': get_oxfordiiitpet}
