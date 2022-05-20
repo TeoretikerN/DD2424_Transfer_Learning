@@ -30,6 +30,25 @@ lambda_u = 1
 save = True # True if saving metric plots
 plotname = 'vanilla_loss_'+str(layers_to_train + 1) # Name of filenames of plots
 
+class AverageMeter(object):
+    """Computes and stores the average and current value
+       Imported from https://github.com/pytorch/examples/blob/master/imagenet/main.py#L247-L262
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
 def set_parameter_requires_grad(model, n_layers):
     count = 0
@@ -44,12 +63,32 @@ def print_params(model):
     for name, param in model.named_parameters():
         print(name, param.size(), param.requires_grad)
 
+def test_model(model, testloader, criterion):
+
+    with torch.no_grad(): #not training
+        running_loss = 0.0
+        running_corrects = 0
+        for inputs, labels in testloader:
+            model.eval()        
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            _, preds = torch.max(outputs, 1)
+            running_loss += loss.item() * inputs.size(0)
+            running_corrects += torch.sum(preds == labels.data)
+        epoch_loss = running_loss / len(testloader.dataset)
+        epoch_acc = running_corrects.double() / len(testloader.dataset)
+    return epoch_loss, epoch_acc
+
+
 def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, patience=999):
     since = time.time()
-    val_acc_history = []
-    val_loss_history = []
-    train_acc_history = []
     train_loss_history = []
+    train_loss_x_history = []
+    train_loss_u_history = []
+    test_acc_history = []
+    test_loss_history = []
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
@@ -58,121 +97,101 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, patienc
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch+1, num_epochs))
         print('-' * 10)
+        # Each epoch trains and then tests
+        ### not sure about the testing
 
-        # Each epoch has a training and validation phase
-        ### no val phase?
-        phases = ['train', 'val']
-        if (epoch+1) == num_epochs:
-            phases.append('test')
-        for phase in phases:
-            if phase == 'train':
-                model.train()  # Set model to training mode
-            else:
-                if phase == 'test':
-                    # load best model weights to return and use for testing
-                    model.load_state_dict(best_model_wts)
-                model.eval()   # Set model to evaluate mode
+        model.train()
+        losses = AverageMeter()
+        losses_x = AverageMeter()
+        losses_u = AverageMeter() #a bit easier to use, equal to running losses
+        running_corrects = 0
+        # Iterate over batches of labeled and unlabeled data.
+        labeled_trainloader, unlabeled_trainloader = dataloaders['train']
+        for lab_batch, unlab_batch in zip(labeled_trainloader, unlabeled_trainloader):
+            inputs_x, targets_x = lab_batch 
+            (inputs_u_w, inputs_u_s), _ = unlab_batch
+            inputs = torch.cat((inputs_x, inputs_u_w, inputs_u_s)).to(device)
+            targets_x = targets_x.to(device)
 
-            running_loss = 0.0
-            running_corrects = 0
+            # zero the parameter gradients
+            optimizer.zero_grad()
 
-            # Iterate over data.
-            if phase == 'train':
-                labeled_trainloader, unlabeled_trainloader = dataloaders[phase]
-                for lab_sample, unlab_sample in zip(labeled_trainloader, unlabeled_trainloader):
-                    inputs_x, targets_x = lab_sample 
-                    (inputs_u_w, inputs_u_s), _ = unlab_sample
-                    inputs = torch.cat((inputs_x, inputs_u_w, inputs_u_s)).to(device)
-                    targets_x = targets_x.to(device)
+            # forward, track history
+            with torch.set_grad_enabled(True):
+                # Get model outputs and calculate loss
+                ###not sure if should 'interleave', or what it is for
+                logits = model(inputs)
+                logits_x = logits[:batch_size]
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                del logits 
 
-                    # zero the parameter gradients
-                    optimizer.zero_grad()
+                #labeled loss, assuming criterion is cross entropy
+                loss_x = criterion(logits_x, targets_x, reduction='mean')
 
-                    # forward
-                    # track history if only in train
-                    with torch.set_grad_enabled(phase == 'train'):
-                        # Get model outputs and calculate loss
-                        ###not sure if should 'interleave', or what it is for
-                        logits = model(inputs)
-                        logits_x = logits[:batch_size]
-                        logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
-                        del logits 
+                #pseudo label with weak augmentation, no temperature used
+                max_probs, targets_u = torch.max(logits_u_w, dim=-1) ### not sure if only max(logits) is needed
+                mask = max_probs.ge(threshold).float() #greater or equal than threshold
 
-                        #labeled loss, assuming criterion is cross entropy
-                        loss_x = criterion(logits_x, targets_x, reduction='mean')
+                #unlabeled loss, pseudolabel and mask
+                loss_u = (criterion(logits_u_s, targets_u,
+                                        reduction='none') * mask).mean()
+                #_, preds = torch.max(outputs, 1) ###how to measure acc?
 
-                        #pseudo label with weak augmentation, no temperature used
-                        max_probs, targets_u = torch.max(logits_u_w, dim=-1) ### not sure if only max(logits) is needed
-                        mask = max_probs.ge(threshold).float() #greater or equal than threshold
+                loss = loss_x + lambda_u * loss_u
 
-                        #unlabeled loss, pseudolabel and mask
-                        loss_u = (criterion(logits_u_s, targets_u,
-                                                reduction='none') * mask).mean()
-                        #_, preds = torch.max(outputs, 1) ###how to measure acc?
+                #if phase == 'train':
+                loss.backward()
+                optimizer.step()
+            # statistics, average is correct for equally sized batches
+            losses.update(loss.item())
+            losses_x.update(loss_x.item())
+            losses_u.update(loss_u.item())
+            #running_corrects += torch.sum(preds == labels.data)
 
-                        loss = loss_x + lambda_u * loss_u
+        epoch_loss = losses.avg
+        train_loss_history.append(epoch_loss)
+        #epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+        #train_acc_history.append(epoch_acc)
+        epoch_loss_x = losses_x.avg
+        train_loss_x_history.append(epoch_loss_x)
+        epoch_loss_u = losses_u.avg
+        train_loss_u_history.append(epoch_loss_u)
 
-                        #if phase == 'train':
-                        loss.backward()
-                        optimizer.step()
-                        ##### Currently working here #####
+        #if epoch+1 == num_epochs: #testing ### not needed?
+            # load best model weights to return and use for testing
+            #model.load_state_dict(best_model_wts)
+ 
+        test_loss, test_acc = test_model(model, dataloaders['test'], criterion)
+        test_loss_history.append(test_loss)
+        test_acc_history.append(test_acc)
+        print('Loss: {:.4f} Test Acc: {:.4f}'.format(epoch_loss, test_acc))
 
-                    # statistics
-                    running_loss += loss.item() * inputs.size(0)
-                    #running_corrects += torch.sum(preds == labels.data)
+        if test_acc > best_acc:
+            patience_count = 0
+            best_acc = test_acc
+            best_model_wts = copy.deepcopy(model.state_dict())
+        else:
+            patience_count +=1
+        if patience_count >= patience:
+            print('Training stopped, Early stopping triggered')
+            model.load_state_dict(best_model_wts)
+            test_loss, test_acc = test_model(model, dataloaders['test'], criterion)
 
-            epoch_loss = running_loss / len(dataloaders[phase].dataset)
-            #epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
-
-            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
-
-            if phase == 'train':
-                train_loss_history.append(epoch_loss)
-                train_acc_history.append(epoch_acc)
-            if phase == 'val':
-                val_acc_history.append(epoch_acc)
-                val_loss_history.append(epoch_loss)
-                # if epoch_acc > prev_acc:
-                if epoch_acc > best_acc:
-                    patience_count = 0
-                    best_acc = epoch_acc
-                    best_model_wts = copy.deepcopy(model.state_dict())
-                else:
-                    patience_count +=1
-                prev_acc = epoch_acc
-                if patience_count >= patience:
-                    print('Training stopped, Early stopping triggered')
-                    model.load_state_dict(best_model_wts)
-                    model.eval()   # Set model to evaluate mode
-                    # Iterate over data.
-                    running_loss = 0.0
-                    running_corrects = 0
-                    for inputs, labels in dataloaders[phase]:
-                        inputs = inputs.to(device)
-                        labels = labels.to(device)
-                        optimizer.zero_grad()
-                        with torch.set_grad_enabled(False):
-                            outputs = model(inputs)
-                            loss = criterion(outputs, labels)
-                            _, preds = torch.max(outputs, 1)
-                            running_loss += loss.item() * inputs.size(0)
-                            running_corrects += torch.sum(preds == labels.data)
-
-                    epoch_loss = running_loss / len(dataloaders[phase].dataset)
-                    epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
-                    test_acc = epoch_acc
-                    print('test Loss: {:.4f} Acc: {:.4f}'.format(epoch_loss, epoch_acc))
-                    time_elapsed = time.time() - since
-                    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-                    #print('Best val Acc: {:4f}'.format(best_acc))
-                    history = {'val_acc' : val_acc_history, 'val_loss' : val_loss_history, 'train_acc' : train_acc_history, 'train_loss' : train_loss_history, 'test_acc' : test_acc}
-                    return model, history
-
+            print('test Loss: {:.4f} Acc: {:.4f}'.format(epoch_loss, test_acc))
+            time_elapsed = time.time() - since
+            print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+            #print('Best val Acc: {:4f}'.format(best_acc))
+            history = {'test_acc' : test_acc_history, 'test_loss' : test_loss_history, 
+                       'train_loss' : train_loss_history, 'train_loss_x' : train_loss_x_history,
+                       'train_loss_u' : train_loss_u_history}
+            return model, history
 
     time_elapsed = time.time() - since
     print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
     #print('Best val Acc: {:4f}'.format(best_acc))
-    history = {'val_acc' : val_acc_history, 'val_loss' : val_loss_history, 'train_acc' : train_acc_history, 'train_loss' : train_loss_history, 'test_acc' : test_acc}
+    history = {'test_acc' : test_acc_history, 'test_loss' : test_loss_history, 
+            'train_loss' : train_loss_history, 'train_loss_x' : train_loss_x_history,
+            'train_loss_u' : train_loss_u_history}
     return model, history
 
 
@@ -192,22 +211,22 @@ if __name__ == '__main__':
     model_ft, input_size = initialize_model(num_classes, layers_to_train, use_pretrained=True)
     print("Model initialized")
     # Loading datasets through oxfordiiitpet.py
-    labeled_dataset, unlabeled_dataset, test_dataset = 
-                                            DATASET_GETTERS["oxfordiiitpet"](num_labeled, "datasets")
+    labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS["oxfordiiitpet"](num_labeled, "datasets")
 
-    ### deleted sampler from dataloader and also drop_last=True
-    #might have to add the drop_last=True
+    ### deleted sampler from dataloader
     labeled_trainloader = torch.utils.data.DataLoader(
         labeled_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4)
+        num_workers=4,
+        drop_last=True)
 
     unlabeled_trainloader = torch.utils.data.DataLoader(
         unlabeled_dataset,
         batch_size=batch_size*mu,
         shuffle=True,
-        num_workers=4)
+        num_workers=4,
+        drop_last=True)
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -268,7 +287,8 @@ if __name__ == '__main__':
             params_to_update.append(param)
 
     optimizer_ft = optim.Adam(params_to_update, lr=0.001)
-    criterion = nn.CrossEntropyLoss()
+    #criterion = nn.CrossEntropyLoss()
+    criterion = nn.functional.cross_entropy()
 
     model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs, patience=patience)
     
