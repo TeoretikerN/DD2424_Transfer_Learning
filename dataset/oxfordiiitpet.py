@@ -7,29 +7,30 @@ from torchvision import datasets
 from torchvision import transforms
 
 #from .randaugment import RandAugmentMC
-from randaugment import RandAugmentMC
+from dataset.randaugment import RandAugmentMC
 
 #logger = logging.getLogger(__name__)
 
 pets_mean = (0.4779, 0.4434, 0.3940)
 pets_std = (0.2677, 0.2630, 0.2697)
-
+INPUT_SIZE = 224
 
 def get_oxfordiiitpet(num_labeled, root):
     num_classes = 37
 
     #have not checked the transforms with the paper
-    transform_labeled = transforms.Compose([
+    train_transform_labeled = transforms.Compose([
+        transforms.RandomResizedCrop(INPUT_SIZE),
         transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(size=32,
-                              padding=int(32*0.125),
-                              padding_mode='reflect'),
         transforms.ToTensor(),
-        transforms.Normalize(mean=pets_mean, std=pets_std)
+        transforms.Normalize(pets_mean, pets_std) # Mean and std calculated below for pet dataset
     ])
-    transform_val = transforms.Compose([
+
+    test_transform_labeled = transforms.Compose([
+        transforms.Resize(INPUT_SIZE),
+        transforms.CenterCrop(INPUT_SIZE),
         transforms.ToTensor(),
-        transforms.Normalize(mean=pets_mean, std=pets_std)
+        transforms.Normalize(pets_mean, pets_std)
     ])
 
     #https://pytorch.org/vision/stable/generated/torchvision.datasets.OxfordIIITPet.html#torchvision.datasets.OxfordIIITPet
@@ -40,7 +41,7 @@ def get_oxfordiiitpet(num_labeled, root):
 
     train_labeled_dataset = OxfordIIITPetSSL(
         root, train_labeled_idxs, split='trainval',
-        target_types='category', transform=transform_labeled)
+        target_types='category', transform=train_transform_labeled, download=False)
 
     train_unlabeled_dataset = OxfordIIITPetSSL(
         root, train_unlabeled_idxs, split='trainval',
@@ -48,7 +49,7 @@ def get_oxfordiiitpet(num_labeled, root):
 
     test_dataset = datasets.OxfordIIITPet(
         root, split='trainval', target_types='category',
-        transform=transform_val, download=False)
+        transform=test_transform_labeled, download=False)
 
     return train_labeled_dataset, train_unlabeled_dataset, test_dataset
 
@@ -78,15 +79,11 @@ def x_u_split(num_labeled, num_classes, labels):
 class TransformFixMatch(object):
     def __init__(self, mean, std):
         self.weak = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(size=32,
-                                  padding=int(32*0.125),
-                                  padding_mode='reflect')])
+            transforms.RandomResizedCrop(INPUT_SIZE),
+            transforms.RandomHorizontalFlip()])
         self.strong = transforms.Compose([
+            transforms.RandomResizedCrop(INPUT_SIZE),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(size=32,
-                                  padding=int(32*0.125),
-                                  padding_mode='reflect'),
             RandAugmentMC(n=2, m=10)])
         self.normalize = transforms.Compose([
             transforms.ToTensor(),
