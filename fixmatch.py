@@ -15,7 +15,7 @@ from dataset.oxfordiiitpet import DATASET_GETTERS
 
 data_dir = "./data/multiclass"
 num_classes = 37
-batch_size = 512
+batch_size = 64
 num_epochs = 40
 patience = 5 # Number of epochs without improving best validation acc
 layers_to_train = 2 # Number of layers to finetune other than the final layer. So [0 <= layers_to_train <= 17].
@@ -64,12 +64,11 @@ def print_params(model):
         print(name, param.size(), param.requires_grad)
 
 def test_model(model, testloader, criterion):
-
+    model.eval()
     with torch.no_grad(): #not training
         running_loss = 0.0
         running_corrects = 0
         for inputs, labels in testloader:
-            model.eval()        
             inputs = inputs.to(device)
             labels = labels.to(device)
             outputs = model(inputs)
@@ -123,18 +122,18 @@ def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, patienc
                 logits = model(inputs)
                 logits_x = logits[:batch_size]
                 logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
-                del logits 
 
                 #labeled loss, assuming criterion is cross entropy
-                loss_x = criterion(logits_x, targets_x, reduction='mean')
+                targets_x = targets_x.type(torch.LongTensor).to(device)
+                loss_x = criterion(logits_x, targets_x)
 
                 #pseudo label with weak augmentation, no temperature used
                 max_probs, targets_u = torch.max(logits_u_w, dim=-1) ### not sure if only max(logits) is needed
                 mask = max_probs.ge(threshold).float() #greater or equal than threshold
 
                 #unlabeled loss, pseudolabel and mask
-                loss_u = (criterion(logits_u_s, targets_u,
-                                        reduction='none') * mask).mean()
+                targets_u = targets_u.type(torch.LongTensor).to(device)
+                loss_u = (criterion(logits_u_s, targets_u) * mask).mean()
                 #_, preds = torch.max(outputs, 1) ###how to measure acc?
 
                 loss = loss_x + lambda_u * loss_u
@@ -232,7 +231,8 @@ if __name__ == '__main__':
         test_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4)
+        num_workers=4,
+        drop_last=True)
 
     # Create training and validation dataloaders
     dataloaders_dict = {'train': [labeled_trainloader, unlabeled_trainloader],
@@ -287,8 +287,8 @@ if __name__ == '__main__':
             params_to_update.append(param)
 
     optimizer_ft = optim.Adam(params_to_update, lr=0.001)
-    #criterion = nn.CrossEntropyLoss()
-    criterion = nn.functional.cross_entropy()
+    criterion = nn.CrossEntropyLoss()
+    #criterion = nn.functional.cross_entropy()
 
     model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs, patience=patience)
     
@@ -318,4 +318,3 @@ if __name__ == '__main__':
     if save:
         plt.savefig(plotname + '_loss.png')
     plt.show()
-
